@@ -33,6 +33,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -209,6 +210,12 @@ func WaitTimeout(c *exec.Cmd, timeout time.Duration) error {
 	}
 }
 
+var timerPool = sync.Pool{
+	New: func() interface{} {
+		return time.NewTimer(1)
+	},
+}
+
 // return true if shutdown is signaled
 func RandomSleep(base time.Duration, precisionLose float64, shutdown <-chan struct{}) bool {
 	// TODO: Last implementation costs too much CPU, find a better way to implement it.
@@ -217,8 +224,11 @@ func RandomSleep(base time.Duration, precisionLose float64, shutdown <-chan stru
 
 // Sleep returns true if shutdown is signaled.
 func Sleep(interval time.Duration, shutdown <-chan struct{}) bool {
+	timer := timerPool.Get().(*time.Timer)
+	defer timerPool.Put(timer)
+	timer.Reset(interval)
 	select {
-	case <-time.After(interval):
+	case <-timer.C:
 		return false
 	case <-shutdown:
 		return true

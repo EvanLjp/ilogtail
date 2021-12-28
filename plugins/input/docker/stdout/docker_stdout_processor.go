@@ -20,10 +20,18 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unsafe"
 
 	"github.com/alibaba/ilogtail"
 	"github.com/alibaba/ilogtail/pkg/logger"
+	"github.com/alibaba/ilogtail/pkg/protocol"
 	"github.com/alibaba/ilogtail/pkg/util"
+)
+
+const (
+	KeyContent = "content"
+	KeyTime    = "_time_"
+	KeySource  = "_source_"
 )
 
 type DockerJSONLog struct {
@@ -49,13 +57,12 @@ type DockerStdoutProcessor struct {
 	collector            ilogtail.Collector
 
 	needCheckStream bool
-	// len(ContainerNameTag map[string]string) + len(DockerJSONLog.keys)
-	allLogKeys   []string
-	allLogValues []string
 
 	// save last parsed logs
-	lastLogs      []*DockerJSONLog
-	lastLogsCount int
+	lastLogs         []*DockerJSONLog
+	lastLogsCount    int
+	logFieldsCount   int
+	fixedLogContents []*protocol.Log_Content
 }
 
 func NewDockerStdoutProcessor(beginLineReg *regexp.Regexp, beginLineTimeout time.Duration, beginLineCheckLength int,
@@ -77,18 +84,12 @@ func NewDockerStdoutProcessor(beginLineReg *regexp.Regexp, beginLineTimeout time
 		processor.needCheckStream = true
 	}
 
-	processor.allLogKeys = append(processor.allLogKeys, "content")
-	processor.allLogKeys = append(processor.allLogKeys, "_time_")
-	processor.allLogKeys = append(processor.allLogKeys, "_source_")
-
-	processor.allLogValues = append(processor.allLogValues, "content")
-	processor.allLogValues = append(processor.allLogValues, "_time_")
-	processor.allLogValues = append(processor.allLogValues, "_source_")
-
 	for key, value := range tags {
-		processor.allLogKeys = append(processor.allLogKeys, key)
-		processor.allLogValues = append(processor.allLogValues, value)
+		processor.fixedLogContents = append(processor.fixedLogContents, &protocol.Log_Content{
+			key, value,
+		})
 	}
+	processor.logFieldsCount = 3 + len(tags)
 	return processor
 }
 
@@ -97,21 +98,22 @@ func NewDockerStdoutProcessor(beginLineReg *regexp.Regexp, beginLineTimeout time
 // 2017-09-12T22:32:21.212861448Z stdout 2017-09-12 22:32:21.212 [INFO][88] table.go 710: Invalidating dataplane cache
 func parseCRILog(line []byte) (*DockerJSONLog, error) {
 	dockerLog := &DockerJSONLog{}
-	log := strings.SplitN(string(line), " ", 3)
+	str := *(*string)(unsafe.Pointer(&line))
+	log := strings.SplitN(str, " ", 3)
 	if len(log) < 3 {
-		dockerLog.LogContent = string(line)
+		dockerLog.LogContent = str
 		return dockerLog, errors.New("invalid CRI log")
 	}
 	dockerLog.Time = log[0]
 	dockerLog.StreamType = log[1]
 
 	// Ref: https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kuberuntime/logs/logs.go#L125-L169
-	content := log[2]
-	if strings.HasPrefix(content, "F ") {
-		content = content[2:]
-	} else if strings.HasPrefix(content, "P ") {
+	var content string
+	if strings.HasPrefix(log[2], "F ") {
+		content = log[2][2:]
+	} else if strings.HasPrefix(log[2], "P ") {
 		// Partial line, trim last line feed.
-		content = content[2:]
+		content = log[2][2:]
 		if len(content) > 0 && content[len(content)-1] == '\n' {
 			content = content[:len(content)-1]
 		}
@@ -165,8 +167,6 @@ func (p *DockerStdoutProcessor) StreamAllowed(log *DockerJSONLog) bool {
 }
 
 func (p *DockerStdoutProcessor) flushLastLog() {
-	p.allLogValues[1] = p.lastLogs[0].Time
-	p.allLogValues[2] = p.lastLogs[0].StreamType
 	var multiLine string
 	for index, log := range p.lastLogs {
 		multiLine += log.LogContent
@@ -176,14 +176,9 @@ func (p *DockerStdoutProcessor) flushLastLog() {
 	if contentSize := len(multiLine); contentSize > 0 && multiLine[contentSize-1] == '\n' {
 		multiLine = multiLine[0 : contentSize-1]
 	}
-	p.allLogValues[0] = multiLine
-	p.collector.AddDataArray(nil, p.allLogKeys, p.allLogValues)
+	p.collector.AddRawLog(p.newRawLog(&multiLine, &p.lastLogs[0].Time, &p.lastLogs[0].StreamType))
 	p.lastLogs = p.lastLogs[:0]
 	p.lastLogsCount = 0
-	// @note force set log values empty to let GC recycle this logs
-	p.allLogValues[0] = ""
-	p.allLogValues[1] = ""
-	p.allLogValues[2] = ""
 }
 
 func (p *DockerStdoutProcessor) Process(fileBlock []byte, noChangeInterval time.Duration) int {
@@ -204,13 +199,7 @@ func (p *DockerStdoutProcessor) Process(fileBlock []byte, noChangeInterval time.
 				if contentSize := len(thisLog.LogContent); contentSize > 0 && thisLog.LogContent[contentSize-1] == '\n' {
 					thisLog.LogContent = thisLog.LogContent[0 : contentSize-1]
 				}
-				p.allLogValues[0] = thisLog.LogContent
-				p.allLogValues[1] = thisLog.Time
-				p.allLogValues[2] = thisLog.StreamType
-				p.collector.AddDataArray(nil, p.allLogKeys, p.allLogValues)
-				p.allLogValues[0] = ""
-				p.allLogValues[1] = ""
-				p.allLogValues[2] = ""
+				p.collector.AddRawLog(p.newRawLog(&thisLog.LogContent, &thisLog.Time, &thisLog.StreamType))
 			case p.beginLineReg == nil:
 				p.lastLogs = append(p.lastLogs, thisLog)
 				p.lastLogsCount += len(thisLog.LogContent) + 24
@@ -247,11 +236,25 @@ func (p *DockerStdoutProcessor) Process(fileBlock []byte, noChangeInterval time.
 
 	// no new line
 	if nowIndex == 0 && len(fileBlock) > 0 {
-		p.allLogValues[0] = string(fileBlock)
-		p.collector.AddDataArray(nil, p.allLogKeys, p.allLogValues)
-		p.allLogValues[0] = ""
+		source := KeySource
+		keyTime := KeyTime
+		p.collector.AddRawLog(p.newRawLog((*string)(unsafe.Pointer(&fileBlock)), &keyTime, &source))
 		processedCount = len(fileBlock)
 	}
 
 	return processedCount
+}
+
+func (p *DockerStdoutProcessor) newRawLog(content, logTime, logType *string) *protocol.Log {
+	l := &protocol.Log{Time: uint32(time.Now().Unix())}
+	l.Contents = make([]*protocol.Log_Content, 0, p.logFieldsCount)
+	l.Contents = append(l.Contents,
+		&protocol.Log_Content{Key: KeyContent, Value: *content},
+		&protocol.Log_Content{Key: KeyTime, Value: *logTime},
+		&protocol.Log_Content{Key: KeySource, Value: *logType},
+	)
+	for i := range l.Contents {
+		l.Contents = append(l.Contents, &(*p.fixedLogContents[i]))
+	}
+	return l
 }

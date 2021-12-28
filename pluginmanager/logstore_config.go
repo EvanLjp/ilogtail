@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/alibaba/ilogtail"
 	"github.com/alibaba/ilogtail/helper"
@@ -431,8 +432,7 @@ func extractTags(rawTags []byte, log *protocol.Log) {
 	if len(rawTags) == 0 {
 		return
 	}
-
-	tagStr := string(rawTags)
+	tagStr := *(*string)(unsafe.Pointer(&rawTags))
 	pairs := strings.Split(tagStr, tagDelimiter)
 	if len(pairs) == 0 {
 		return
@@ -459,9 +459,11 @@ func extractTags(rawTags []byte, log *protocol.Log) {
 // ProcessRawLogV2 ...
 // V1 -> V2: enable topic field, and use tags field to pass more tags.
 func (lc *LogstoreConfig) ProcessRawLogV2(rawLog []byte, packID string, topic string, tags []byte) int {
-	log := &protocol.Log{}
+	log := &protocol.Log{
+		Contents: make([]*protocol.Log_Content, 8),
+	}
 	log.Contents = append(log.Contents,
-		&protocol.Log_Content{Key: rawStringKey, Value: string(rawLog)})
+		&protocol.Log_Content{Key: rawStringKey, Value: *(*string)(unsafe.Pointer(&rawLog))})
 	if len(topic) > 0 {
 		log.Contents = append(log.Contents,
 			&protocol.Log_Content{Key: "__log_topic__", Value: topic})
